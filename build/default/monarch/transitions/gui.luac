@@ -1,0 +1,548 @@
+
+≠˙
+¥Xlocal monarch = require "monarch.monarch"
+local easings = require "monarch.transitions.easings"
+
+local M = {}
+
+local WIDTH = nil
+local HEIGHT = nil
+local LEFT = nil
+local RIGHT = nil
+local TOP = nil
+local BOTTOM = nil
+
+local ZERO_SCALE = vmath.vector3(0, 0, 1)
+
+local LAYOUT_CHANGED = hash("layout_changed")
+
+-- Notify the transition system that the window size has changed
+-- @param width
+-- @param height
+function M.window_resized(width, height)
+	WIDTH = width
+	HEIGHT = height
+	LEFT = vmath.vector3(-WIDTH * 2, 0, 0)
+	RIGHT = vmath.vector3(WIDTH * 2, 0, 0)
+	TOP = vmath.vector3(0, HEIGHT * 2, 0)
+	BOTTOM = vmath.vector3(0, - HEIGHT * 2, 0)
+end
+
+M.window_resized(tonumber(sys.get_config("display.width")), tonumber(sys.get_config("display.height")))
+
+
+function M.instant(node, to, easing, duration, delay, cb)
+	cb()
+end
+
+local function slide_in(direction, node, to, easing, duration, delay, cb)
+	local from = to + direction
+	gui.set_position(node, from)
+	gui.animate(node, gui.PROP_POSITION, to, easing, duration, delay, cb)
+end
+
+function M.slide_in_left(node, to, easing, duration, delay, cb)
+	return slide_in(LEFT, node, to.pos, easing, duration, delay, cb)
+end
+
+function M.slide_in_right(node, to, easing, duration, delay, cb)
+	slide_in(RIGHT, node, to.pos, easing, duration, delay, cb)
+end
+
+function M.slide_in_top(node, to, easing, duration, delay, cb)
+	slide_in(TOP, node, to.pos, easing, duration, delay, cb)
+end
+
+function M.slide_in_bottom(node, to, easing, duration, delay, cb)
+	slide_in(BOTTOM, node, to.pos, easing, duration, delay, cb)
+end
+
+
+local function slide_out(direction, node, from, easing, duration, delay, cb)
+	local to = from + direction
+	gui.set_position(node, from)
+	gui.animate(node, gui.PROP_POSITION, to, easing, duration, delay, cb)
+end
+
+function M.slide_out_left(node, from, easing, duration, delay, cb)
+	slide_out(LEFT, node, from.pos, easing, duration, delay, cb)
+end
+
+function M.slide_out_right(node, from, easing, duration, delay, cb)
+	slide_out(RIGHT, node, from.pos, easing, duration, delay, cb)
+end
+
+function M.slide_out_top(node, from, easing, duration, delay, cb)
+	slide_out(TOP, node, from.pos, easing, duration, delay, cb)
+end
+
+function M.slide_out_bottom(node, from, easing, duration, delay, cb)
+	slide_out(BOTTOM, node, from.pos, easing, duration, delay, cb)
+end
+
+function M.scale_in(node, to, easing, duration, delay, cb)
+	gui.set_scale(node, ZERO_SCALE)
+	gui.animate(node, gui.PROP_SCALE, to.scale, easing, duration, delay, cb)
+end
+
+function M.scale_out(node, from, easing, duration, delay, cb)
+	gui.set_scale(node, from.scale)
+	gui.animate(node, gui.PROP_SCALE, ZERO_SCALE, easing, duration, delay, cb)
+end
+
+function M.fade_out(node, from, easing, duration, delay, cb)
+	local to = gui.get_color(node)
+	to.w = 1
+	gui.set_color(node, to)
+	to.w = 0
+	gui.animate(node, gui.PROP_COLOR, to, easing, duration, delay, cb)
+end
+
+function M.fade_in(node, from, easing, duration, delay, cb)
+	local to = gui.get_color(node)
+	to.w = 0
+	gui.set_color(node, to)
+	to.w = 1
+	gui.animate(node, gui.PROP_COLOR, to, easing, duration, delay, cb)
+end
+
+
+
+--- Create a transition
+-- @return Transition instance
+local function create()
+	local instance = {}
+
+	local transitions = {
+		[monarch.TRANSITION.SHOW_IN] = { urls = {}, transitions = {}, in_progress_count = 0, },
+		[monarch.TRANSITION.SHOW_OUT] = { urls = {}, transitions = {}, in_progress_count = 0, },
+		[monarch.TRANSITION.BACK_IN] = { urls = {}, transitions = {}, in_progress_count = 0, },
+		[monarch.TRANSITION.BACK_OUT] = { urls = {}, transitions = {}, in_progress_count = 0, },
+	}
+
+	local current_transition = nil
+
+	local function create_transition(transition_id, node, fn, easing, duration, delay)
+		local t = transitions[transition_id]
+		-- find if there's already a transition for the node in
+		-- question and if so update it instead of creating a new
+		-- transition
+		for _,transition in ipairs(t) do
+			if transition.node == node then
+				transition.fn = fn
+				transition.easing = easing
+				transition.duration = duration
+				transitions.delay = delay
+				return
+			end
+		end
+		-- create new transition
+		t.transitions[#t.transitions + 1] = {
+			node = node,
+			node_data = {
+				pos = gui.get_position(node),
+				scale = gui.get_scale(node),
+			},
+			fn = fn,
+			easing = easing,
+			duration = duration,
+			delay = delay,
+			id = transition_id
+		}
+	end
+
+	local function finish_transition(transition_id)
+		local t = transitions[transition_id]
+		if #t.urls > 0 then
+			local message = { transition = transition_id }
+			while #t.urls > 0 do
+				local url = table.remove(t.urls)
+				msg.post(url, monarch.TRANSITION.DONE, message)
+			end
+		end
+		current_transition = nil
+	end
+
+	local function check_and_finish_transition(transition_id)
+		local t = transitions[transition_id]
+		if t.in_progress_count == 0 then
+			finish_transition(transition_id)
+		end
+	end
+
+	local function start_transition(transition_id, url)
+		local t = transitions[transition_id]
+		table.insert(t.urls, url)
+		if t.in_progress_count == 0 then
+			table.insert(t.urls, msg.url())
+			current_transition = t
+			current_transition.id = transition_id
+			if #t.transitions > 0 then
+				for i=1,#t.transitions do
+					local transition = t.transitions[i]
+					t.in_progress_count = t.in_progress_count + 1
+					transition.fn(transition.node, transition.node_data, transition.easing, transition.duration, transition.delay or 0, function()
+						t.in_progress_count = t.in_progress_count - 1
+						check_and_finish_transition(transition_id)
+					end)
+				end
+			else
+				check_and_finish_transition(transition_id)
+			end
+		end
+	end
+
+	-- Forward on_message calls here
+	function instance.handle(message_id, message, sender)
+		if message_id == LAYOUT_CHANGED then
+			for _,t in pairs(transitions) do
+				for _,transitions in pairs(t.transitions) do
+					transitions.node_data.pos = gui.get_position(transitions.node)
+				end
+			end
+			-- replay the current transition if the layout changes
+			-- this will ensure that things are still hidden if they
+			-- were transitioned out
+			if current_transition then
+				for _,transition in pairs(current_transition.transitions) do
+					local node = transition.node
+					transition.fn(transition.node, transition.node_data, transition.easing, 0, 0)
+				end
+				if current_transition.in_progress_count > 0 then
+					finish_transition(current_transition.id)
+				end
+			end
+		elseif message_id == monarch.TRANSITION.SHOW_IN
+		or message_id == monarch.TRANSITION.SHOW_OUT
+		or message_id == monarch.TRANSITION.BACK_IN
+		or message_id == monarch.TRANSITION.BACK_OUT then
+			start_transition(message_id, sender)
+		end
+	end
+
+	-- Specify the transition function when this node is transitioned
+	-- to
+	-- @param fn Transition function (see slide_in_left and other above)
+	-- @param easing Easing function to use
+	-- @param duration Transition duration
+	-- @param delay Transition delay
+	function instance.show_in(node, fn, easing, duration, delay)
+		create_transition(monarch.TRANSITION.SHOW_IN, node, fn, easing, duration, delay)
+		return instance
+	end
+
+	-- Specify the transition function when this node is transitioned
+	-- from when showing another screen
+	function instance.show_out(node, fn, easing, duration, delay)
+		create_transition(monarch.TRANSITION.SHOW_OUT, node, fn, easing, duration, delay)
+		return instance
+	end
+
+	--- Specify the transition function when this node is transitioned
+	-- to when navigating back in the screen stack
+	function instance.back_in(node, fn, easing, duration, delay)
+		create_transition(monarch.TRANSITION.BACK_IN, node, fn, easing, duration, delay)
+		return instance
+	end
+
+	--- Specify the transition function when this node is transitioned
+	-- from when navigating back in the screen stack
+	function instance.back_out(node, fn, easing, duration, delay)
+		create_transition(monarch.TRANSITION.BACK_OUT, node, fn, easing, duration, delay)
+		return instance
+	end
+
+	return instance
+end
+
+function M.create(node)
+	local instance = create()
+	-- backward compatibility with the old version of create
+	-- where a single node was used
+	if node then
+		local show_in = instance.show_in
+		local show_out = instance.show_out
+		local back_in = instance.back_in
+		local back_out = instance.back_out
+		instance.show_in = function(fn, easing, duration, delay)
+			return show_in(node, fn, easing, duration, delay)
+		end
+		instance.show_out = function(fn, easing, duration, delay)
+			return show_out(node, fn, easing, duration, delay)
+		end
+		instance.back_in = function(fn, easing, duration, delay)
+			return back_in(node, fn, easing, duration, delay)
+		end
+		instance.back_out = function(fn, easing, duration, delay)
+			return back_out(node, fn, easing, duration, delay)
+		end
+	end
+	return instance
+end
+
+
+--- Create transition where the screen slides in from the right when shown and out
+-- to the left when hidden (and the reverse when going back)
+-- @param node
+-- @param duration
+-- @param delay Optional. Defaults to 0
+-- @param easing Optional. A constant from monarch.transitions.easing
+-- @return Transition instance
+function M.in_right_out_left(node, duration, delay, easing)
+	assert(node, "You must provide a node")
+	assert(duration, "You must provide a duration")
+	easing = easing or easings.QUAD()
+	return M.create(node)
+	.show_in(M.slide_in_right, easing.OUT, duration, delay or 0)
+	.show_out(M.slide_out_left, easing.IN, duration, delay or 0)
+	.back_in(M.slide_in_left, easing.OUT, duration, delay or 0)
+	.back_out(M.slide_out_right, easing.IN, duration, delay or 0)
+end
+
+
+function M.in_left_out_right(node, duration, delay, easing)
+	assert(node, "You must provide a node")
+	assert(duration, "You must provide a duration")
+	easing = easing or easings.QUAD()
+	return M.create(node)
+	.show_in(M.slide_in_left, easing.OUT, duration, delay or 0)
+	.show_out(M.slide_out_right, easing.IN, duration, delay or 0)
+	.back_in(M.slide_in_right, easing.OUT, duration, delay or 0)
+	.back_out(M.slide_out_left, easing.IN, duration, delay or 0)
+end
+
+
+function M.in_right_out_right(node, duration, delay, easing)
+	assert(node, "You must provide a node")
+	assert(duration, "You must provide a duration")
+	easing = easing or easings.QUAD()
+	return M.create(node)
+	.show_in(M.slide_in_right, easing.OUT, duration, delay or 0)
+	.show_out(M.slide_out_right, easing.IN, duration, delay or 0)
+	.back_in(M.slide_in_right, easing.OUT, duration, delay or 0)
+	.back_out(M.slide_out_right, easing.IN, duration, delay or 0)
+end
+
+
+function M.in_left_out_left(node, duration, delay, easing)
+	assert(node, "You must provide a node")
+	assert(duration, "You must provide a duration")
+	easing = easing or easings.QUAD()
+	return M.create(node)
+	.show_in(M.slide_in_left, easing.OUT, duration, delay or 0)
+	.show_out(M.slide_out_left, easing.IN, duration, delay or 0)
+	.back_in(M.slide_in_left, easing.OUT, duration, delay or 0)
+	.back_out(M.slide_out_left, easing.IN, duration, delay or 0)
+end
+
+
+function M.fade_in_out(node, duration, delay, easing)
+	assert(node, "You must provide a node")
+	assert(duration, "You must provide a duration")
+	easing = easing or easings.QUAD()
+	return M.create(node)
+	.show_in(M.fade_in, easing.OUT, duration, delay or 0)
+	.show_out(M.fade_out, easing.IN, duration, delay or 0)
+	.back_in(M.fade_in, easing.OUT, duration, delay or 0)
+	.back_out(M.fade_out, easing.IN, duration, delay or 0)
+end
+
+
+return M
+/monarch/transitions/gui.luaÈPLJ =/monarch/transitions/gui.luaì %Z.   . 6  9-    )  )  B. 6  9-   )  )  B. 6  9)  -  )  B. 6  9)  -   )  B. K  ÄÄÄÄÄÄvector3
+vmathWIDTH HEIGHT LEFT RIGHT TOP BOTTOM width  &height  & G    1  BK  node  to  easing  duration  delay  cb   Ã   S$  6  9	 
+ B6  9	 6
+  9
+
+     BK  PROP_POSITIONanimateset_positionguidirection  node  to  easing  duration  delay  cb  from  {  	E*-  -   9	 
+    D ¿Äposslide_in LEFT node  
+to  
+easing  
+duration  
+delay  
+cb  
+ Å  
+G.-  -   9	 
+    BK  ¿Äposslide_in RIGHT node  to  easing  duration  delay  cb     
+E2-  -   9	 
+    BK  ¿Äposslide_in TOP node  to  easing  duration  delay  cb   Ç  
+H6-  -   9	 
+    BK  ¿Äposslide_in BOTTOM node  to  easing  duration  delay  cb   Ã   S;  6  9	 
+ B6  9	 6
+  9
+
+     BK  PROP_POSITIONanimateset_positionguidirection  node  from  easing  duration  delay  cb  to  É  
+IA-  -   9	 
+    BK  ¿Äposslide_out LEFT node  from  easing  duration  delay  cb   Ñ  
+JE-  -   9	 
+    BK  ¿Äposslide_out RIGHT node  from  easing  duration  delay  cb   Ç  
+HI-  -   9	 
+    BK  ¿Äposslide_out TOP node  from  easing  duration  delay  cb   Ö  
+KM-  -   9	 
+    BK  ¿Äposslide_out BOTTOM node  from  easing  duration  delay  cb   ¡  JQ6  9  -  B6  9  6  99	
+    BK  	¿
+scalePROP_SCALEanimateset_scaleguiZERO_SCALE node  to  easing  duration  delay  cb   √  LV6  9  9B6  9  6  9-	  
+    BK  	¿PROP_SCALEanimate
+scaleset_scaleguiZERO_SCALE node  from  easing  duration  delay  cb   È   N[6  9  B) =6  9  	 B)  =6  9  6	  9		
+     BK  PROP_COLORanimateset_colorwget_colorguinode  from  easing  duration  delay  cb  to  È   Nc6  9  B)  =6  9  	 B) =6  9  6	  9		
+     BK  PROP_COLORanimateset_colorwget_colorguinode  from  easing  duration  delay  cb  to  ¨ *ç{-  8 6   BX
+	Ä9 XÄ===-  =K  E
+R
+ı99  5	 =	5
+
+ 6 9	 B=
+6 9 B=
+=
+	=	=	=	=	= 	<	K  ¿idnode_data
+scaleget_scalepos  get_positiongui  transitions
+delaydurationeasingfn	nodeipairs	
+
+transitions transition_id  +node  +fn  +easing  +duration  +delay  +t (  _ 	transition  	 ¨ 	 jò
+-  8 9  )   XÄ5 = 9  )   XÄUÄ6 99 B6 9 - 99 BXÌ1  K  ¿  Ä	DONETRANSITION	postmsgremove
+tabletransition  	urls	
+transitions monarch current_transition transition_id  t message url 
+ Ç 	<§-  8 9 	  XÄ-   BK  ¿¿in_progress_count transitions finish_transition transition_id  
+t  ~  	6∂-   -  9  =  -  - B K  ¿  ¿in_progress_countt check_and_finish_transition transition_id  Ò5•´-  8 6  99 B9	  X)Ä6  996 9B A. - = 9 )   XÄ) 9 ) MÄ989=99		9
+
+999  XÄ)  3 BOÔXÄ-   B2  ÄK  ¿Ä¿ 
+delaydurationeasingnode_data	nodefntransitionsidurlmsgin_progress_count	urlsinsert
+table 		
+
+
+transitions current_transition check_and_finish_transition transition_id  6url  6t 3  i transition  ”  Jë¬-    X.Ä6  - BHÄ6  9	BHÄ96 99B=FR¯FRÚ-   X1Ä6  - 9BHÄ99	9
+99)  )  B	FRˆ- 9	)   XÄ- - 9
+BXÄ- 99  XÄ- 99  X
+Ä- 99  XÄ- 99  XÄ-    BK   ¿Ä¿  ¿BACK_OUTBACK_INSHOW_OUTSHOW_INTRANSITIONidin_progress_counteasingfn	nodeget_positionguiposnode_datatransitions
+pairs
+
+
+LAYOUT_CHANGED transitions current_transition finish_transition monarch start_transition message_id  Kmessage  Ksender  K  _ t  	 	 	_ transitions    _ transition  node  ¨  X„-  - 9 9   	 
+  B- L ¿   ¿SHOW_INTRANSITIONcreate_transition monarch instance node  fn  easing  duration  delay   ≠  XÍ-  - 9 9   	 
+  B- L ¿   ¿SHOW_OUTTRANSITIONcreate_transition monarch instance node  fn  easing  duration  delay   ¨  XÒ-  - 9 9   	 
+  B- L ¿   ¿BACK_INTRANSITIONcreate_transition monarch instance node  fn  easing  duration  delay   ≠  X¯-  - 9 9   	 
+  B- L ¿   ¿BACK_OUTTRANSITIONcreate_transition monarch instance node  fn  easing  duration  delay   é  7÷oè4   4 -  9 95 4  =4  =<-  9 95 4  =4  =<-  9 95 4  =4  =<-  9 9	5
+ 4  =4  =<+  3 3 3 3 3 = 3 = 3 = 3 = 3 = 2  ÄL   ¿
+¿ back_out back_in show_out show_in handle     in_progress_count BACK_OUT in_progress_count BACK_IN in_progress_count SHOW_OUTtransitions	urls in_progress_count SHOW_INTRANSITION
+'3:PlSwt~{ÖÇåâéémonarch LAYOUT_CHANGED instance 6transitions %current_transition create_transition finish_transition check_and_finish_transition start_transition  a 
+  6â-  -     	 D ¿ ¿show_in node fn  easing  duration  delay   b 
+  7å-  -     	 D ¿ ¿show_out node fn  easing  duration  delay   a 
+  6è-  -     	 D ¿ ¿back_in node fn  easing  duration  delay   b 
+  7í-  -     	 D ¿ ¿back_out node fn  easing  duration  delay   ÷ WÄ-  B   XÄ9 9993 = 3 =3 =3 =2 Ä2  ÄL ¿    back_outback_inshow_outshow_increate node  instance show_in show_out 
+back_in 	back_out  ˜ 	 6d°	6    ' B6   ' B  XÄ-  9B - 9  B9- 99  XÄ)  B9- 9	9
+  XÄ)  B9- 99  XÄ)  B9- 99
+  XÄ)  D ¿¿slide_out_rightback_outslide_in_leftback_inINslide_out_leftshow_outOUTslide_in_rightshow_increate	QUAD You must provide a durationYou must provide a nodeasserteasings M node  7duration  7delay  7easing  7 ˜ 	 6d≠	6    ' B6   ' B  XÄ-  9B - 9  B9- 99  XÄ)  B9- 9	9
+  XÄ)  B9- 99  XÄ)  B9- 99
+  XÄ)  D ¿¿slide_out_leftback_outslide_in_rightback_inINslide_out_rightshow_outOUTslide_in_leftshow_increate	QUAD You must provide a durationYou must provide a nodeasserteasings M node  7duration  7delay  7easing  7 ⁄ 	 6dπ	6    ' B6   ' B  XÄ-  9B - 9  B9- 99  XÄ)  B9- 9	9
+  XÄ)  B9- 99  XÄ)  B9- 9	9
+  XÄ)  D ¿¿back_outback_inINslide_out_rightshow_outOUTslide_in_rightshow_increate	QUAD You must provide a durationYou must provide a nodeasserteasings M node  7duration  7delay  7easing  7 ÿ 	 6d≈	6    ' B6   ' B  XÄ-  9B - 9  B9- 99  XÄ)  B9- 9	9
+  XÄ)  B9- 99  XÄ)  B9- 9	9
+  XÄ)  D ¿¿back_outback_inINslide_out_leftshow_outOUTslide_in_leftshow_increate	QUAD You must provide a durationYou must provide a nodeasserteasings M node  7duration  7delay  7easing  7 Ã 	 6d—	6    ' B6   ' B  XÄ-  9B - 9  B9- 99  XÄ)  B9- 9	9
+  XÄ)  B9- 99  XÄ)  B9- 9	9
+  XÄ)  D ¿¿back_outback_inINfade_outshow_outOUTfade_inshow_increate	QUAD You must provide a durationYou must provide a nodeasserteasings M node  7duration  7delay  7easing  7 ä  7 Lû ﬁ6   ' B 6  ' B4  , 6	 9		)
+  )  ) B	6
+ ' B
+3 =96	 6
+ 9' B A 6	 6
+ 9' B A  A3 =3 3 =3 =3 =3 =3 3 =3 =3 =3! = 3# ="3% =$3' =&3) =(3* 3, =+3. =-30 =/32 =134 =336 =52  ÄL  fade_in_out in_left_out_left in_right_out_right in_left_out_right in_right_out_left create  fade_in fade_out scale_out scale_in slide_out_bottom slide_out_top slide_out_right slide_out_left  slide_in_bottom slide_in_top slide_in_right slide_in_left  instantdisplay.heightdisplay.widthget_configsystonumber window_resizedlayout_changed	hashvector3
+vmath monarch.transitions.easingsmonarch.monarchrequire                                 "   ( , * 0 . 4 2 8 6 ? C A G E K I O M T Q Y V a [ i c ˛  *!6-B9NEZQ]]monarch Ieasings FM EWIDTH DHEIGHT  DLEFT  DRIGHT  DTOP  DBOTTOM  DZERO_SCALE >LAYOUT_CHANGED ;slide_in (slide_out 	create   "ÈPLJ=/monarch/transitions/gui.luaì %Z.   . 6  9-    )  )  B. 6  9-   )  )  B. 6  9)  -  )  B. 6  9)  -   )  B. K  ÄÄÄÄÄÄvector3
+vmathWIDTH HEIGHT LEFT RIGHT TOP BOTTOM width  &height  & G    1  BK  node  to  easing  duration  delay  cb   Ã   S$  6  9
+  B6  9
+ 6  9     BK  PROP_POSITIONanimateset_positionguidirection  node  to  easing  duration  delay  cb  from  {  	E*-  - 	  9
+     D ¿Äposslide_in LEFT node  
+to  
+easing  
+duration  
+delay  
+cb  
+ Å  
+G.-  - 	  9
+     BK  ¿Äposslide_in RIGHT node  to  easing  duration  delay  cb     
+E2-  - 	  9
+     BK  ¿Äposslide_in TOP node  to  easing  duration  delay  cb   Ç  
+H6-  - 	  9
+     BK  ¿Äposslide_in BOTTOM node  to  easing  duration  delay  cb   Ã   S;  6  9
+  B6  9
+ 6  9     BK  PROP_POSITIONanimateset_positionguidirection  node  from  easing  duration  delay  cb  to  É  
+IA-  - 	  9
+     BK  ¿Äposslide_out LEFT node  from  easing  duration  delay  cb   Ñ  
+JE-  - 	  9
+     BK  ¿Äposslide_out RIGHT node  from  easing  duration  delay  cb   Ç  
+HI-  - 	  9
+     BK  ¿Äposslide_out TOP node  from  easing  duration  delay  cb   Ö  
+KM-  - 	  9
+     BK  ¿Äposslide_out BOTTOM node  from  easing  duration  delay  cb   ¡  JQ6  9  -	  B6  9  6	  9		9
+    BK  	¿
+scalePROP_SCALEanimateset_scaleguiZERO_SCALE node  to  easing  duration  delay  cb   √  LV6  9  9	B6  9  6	  9		-
+      BK  	¿PROP_SCALEanimate
+scaleset_scaleguiZERO_SCALE node  from  easing  duration  delay  cb   È   N[6  9  B) =6  9	  
+ B)  =6  9	  6
+  9
+
+     BK  PROP_COLORanimateset_colorwget_colorguinode  from  easing  duration  delay  cb  to  È   Nc6  9  B)  =6  9	  
+ B) =6  9	  6
+  9
+
+     BK  PROP_COLORanimateset_colorwget_colorguinode  from  easing  duration  delay  cb  to  ¨ *ç{-  8 6  	 BX
+	Ä9 XÄ===-  =K  E
+R
+ı99  5	 =	5
+
+ 6 9	 B=
+6 9 B=
+=
+	=	=	=	=	= 	<	K  ¿idnode_data
+scaleget_scalepos  get_positiongui  transitions
+delaydurationeasingfn	nodeipairs	
+
+transitions transition_id  +node  +fn  +easing  +duration  +delay  +t (  _ 	transition  	 ¨ 		 jò
+-  8 9  )   XÄ5 = 9  )   XÄUÄ6 99 B6 9 - 99 BXÌ1  K  ¿  Ä	DONETRANSITION	postmsgremove
+tabletransition  	urls	
+transitions monarch current_transition transition_id  t message url 
+ Ç 	<§-  8 9 	  XÄ-   BK  ¿¿in_progress_count transitions finish_transition transition_id  
+t  ~  	6∂-   -  9  =  -  - B K  ¿  ¿in_progress_countt check_and_finish_transition transition_id  Ò5•´-  8 6  99 B9	  X)Ä6  996 9B A. - = 9 )   XÄ) 9 ) MÄ989=99
+	9
+999  XÄ)  3 BOÔXÄ-   B2  ÄK  ¿Ä¿ 
+delaydurationeasingnode_data	nodefntransitionsidurlmsgin_progress_count	urlsinsert
+table 		
+
+
+transitions current_transition check_and_finish_transition transition_id  6url  6t 3  i transition  ”  Jë¬-    X.Ä6  - BHÄ6  9
+BHÄ96 99B=FR¯FRÚ-   X1Ä6  - 9BHÄ99	999)  )  B	FRˆ- 9	)   XÄ- - 9
+BXÄ- 99  XÄ- 99  X
+Ä- 99  XÄ- 99  XÄ-    BK   ¿Ä¿  ¿BACK_OUTBACK_INSHOW_OUTSHOW_INTRANSITIONidin_progress_counteasingfn	nodeget_positionguiposnode_datatransitions
+pairs
+
+
+LAYOUT_CHANGED transitions current_transition finish_transition monarch start_transition message_id  Kmessage  Ksender  K  _ t  	 	 	_ transitions    _ transition  node  ¨  X„-  - 9 9  	 
+   B- L ¿   ¿SHOW_INTRANSITIONcreate_transition monarch instance node  fn  easing  duration  delay   ≠  XÍ-  - 9 9  	 
+   B- L ¿   ¿SHOW_OUTTRANSITIONcreate_transition monarch instance node  fn  easing  duration  delay   ¨  XÒ-  - 9 9  	 
+   B- L ¿   ¿BACK_INTRANSITIONcreate_transition monarch instance node  fn  easing  duration  delay   ≠  X¯-  - 9 9  	 
+   B- L ¿   ¿BACK_OUTTRANSITIONcreate_transition monarch instance node  fn  easing  duration  delay   é  7÷oè4   4 -  9 95 4  =4  =<-  9 95 4  =4  =<-  9 95 4  =4  =<-  9 9	5
+ 4  =4  =<+  3 3 3 3 3 = 3 = 3 = 3 = 3 = 2  ÄL   ¿
+¿ back_out back_in show_out show_in handle     in_progress_count BACK_OUT in_progress_count BACK_IN in_progress_count SHOW_OUTtransitions	urls in_progress_count SHOW_INTRANSITION
+'3:PlSwt~{ÖÇåâéémonarch LAYOUT_CHANGED instance 6transitions %current_transition create_transition finish_transition check_and_finish_transition start_transition  a   6â-  -    	 
+ D ¿ ¿show_in node fn  easing  duration  delay   b   7å-  -    	 
+ D ¿ ¿show_out node fn  easing  duration  delay   a   6è-  -    	 
+ D ¿ ¿back_in node fn  easing  duration  delay   b   7í-  -    	 
+ D ¿ ¿back_out node fn  easing  duration  delay   ÷ WÄ-  B   XÄ9 9993 = 3 =3 =3 =2 Ä2  ÄL ¿    back_outback_inshow_outshow_increate node  instance show_in show_out 
+back_in 	back_out  ˜ 
+ 6d°	6    ' B6   ' B  XÄ-  9B - 9  B9- 99 	 X	Ä)	  B9- 9	9
+ 	 X	Ä)	  B9- 99 	 X	Ä)	  B9- 99
+ 	 X	Ä)	  D ¿¿slide_out_rightback_outslide_in_leftback_inINslide_out_leftshow_outOUTslide_in_rightshow_increate	QUAD You must provide a durationYou must provide a nodeasserteasings M node  7duration  7delay  7easing  7 ˜ 
+ 6d≠	6    ' B6   ' B  XÄ-  9B - 9  B9- 99 	 X	Ä)	  B9- 9	9
+ 	 X	Ä)	  B9- 99 	 X	Ä)	  B9- 99
+ 	 X	Ä)	  D ¿¿slide_out_leftback_outslide_in_rightback_inINslide_out_rightshow_outOUTslide_in_leftshow_increate	QUAD You must provide a durationYou must provide a nodeasserteasings M node  7duration  7delay  7easing  7 ⁄ 
+ 6dπ	6    ' B6   ' B  XÄ-  9B - 9  B9- 99 	 X	Ä)	  B9- 9	9
+ 	 X	Ä)	  B9- 99 	 X	Ä)	  B9- 9	9
+ 	 X	Ä)	  D ¿¿back_outback_inINslide_out_rightshow_outOUTslide_in_rightshow_increate	QUAD You must provide a durationYou must provide a nodeasserteasings M node  7duration  7delay  7easing  7 ÿ 
+ 6d≈	6    ' B6   ' B  XÄ-  9B - 9  B9- 99 	 X	Ä)	  B9- 9	9
+ 	 X	Ä)	  B9- 99 	 X	Ä)	  B9- 9	9
+ 	 X	Ä)	  D ¿¿back_outback_inINslide_out_leftshow_outOUTslide_in_leftshow_increate	QUAD You must provide a durationYou must provide a nodeasserteasings M node  7duration  7delay  7easing  7 Ã 
+ 6d—	6    ' B6   ' B  XÄ-  9B - 9  B9- 99 	 X	Ä)	  B9- 9	9
+ 	 X	Ä)	  B9- 99 	 X	Ä)	  B9- 9	9
+ 	 X	Ä)	  D ¿¿back_outback_inINfade_outshow_outOUTfade_inshow_increate	QUAD You must provide a durationYou must provide a nodeasserteasings M node  7duration  7delay  7easing  7 ä  7 Lû ﬁ6   ' B 6  ' B4  , 6	 9		)  )  ) B	6
+ ' B
+3 =96	 6
+ 9' B A 6	 6
+ 9' B A  A3 =3 3 =3 =3 =3 =3 3 =3 =3 =3! = 3# ="3% =$3' =&3) =(3* 3, =+3. =-30 =/32 =134 =336 =52  ÄL  fade_in_out in_left_out_left in_right_out_right in_left_out_right in_right_out_left create  fade_in fade_out scale_out scale_in slide_out_bottom slide_out_top slide_out_right slide_out_left  slide_in_bottom slide_in_top slide_in_right slide_in_left  instantdisplay.heightdisplay.widthget_configsystonumber window_resizedlayout_changed	hashvector3
+vmath monarch.transitions.easingsmonarch.monarchrequire                                 "   ( , * 0 . 4 2 8 6 ? C A G E K I O M T Q Y V a [ i c ˛  *!6-B9NEZQ]]monarch Ieasings FM EWIDTH DHEIGHT  DLEFT  DRIGHT  DTOP  DBOTTOM  DZERO_SCALE >LAYOUT_CHANGED ;slide_in (slide_out 	create   monarch.monarchmonarch.transitions.easings/monarch/monarch.luac!/monarch/transitions/easings.luac" 

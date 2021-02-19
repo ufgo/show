@@ -1,0 +1,11 @@
+packages/res/
+com.defold.android/res/
+com.google.android.gms-play-services-ads-lite-17.2.1.aar/res/
+com.google.android.gms-play-services-ads-17.2.1.aar/res/
+androidx.core-core-1.2.0.aar/res/
+androidx.appcompat-appcompat-1.0.0.aar/res/
+com.google.android.gms-play-services-basement-17.5.0.aar/res/
+androidx.browser-browser-1.0.0.aar/res/
+androidx.coordinatorlayout-coordinatorlayout-1.0.0.aar/res/
+com.google.android.gms-play-services-base-17.5.0.aar/res/
+com.google.android.gms-play-services-auth-18.1.0.aar/res/

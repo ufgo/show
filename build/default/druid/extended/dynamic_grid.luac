@@ -1,0 +1,682 @@
+
+”Ì
+ÛY--- Component to handle placing components in row
+-- @module druid.dynamic_grid
+
+--- Component events
+-- @table Events
+-- @tfield druid_event on_add_item On item add callback
+-- @tfield druid_event on_remove_item On item remove callback
+-- @tfield druid_event on_change_items On item add or remove callback
+-- @tfield druid_event on_clear On grid clear callback
+-- @tfield druid_event on_update_positions On update item positions callback
+
+--- Component fields
+-- @table Fields
+-- @tfield node parent Parent gui node
+-- @tfield node[] nodes List of all grid nodes
+-- @tfield number first_index The first index of node in grid
+-- @tfield number last_index The last index of node in grid
+-- @tfield vector3 node_size Item size
+-- @tfield vector4 border The size of item content
+
+local const = require("druid.const")
+local Event = require("druid.event")
+local helper = require("druid.helper")
+local component = require("druid.component")
+
+local DynamicGrid = component.create("dynamic_grid", { const.ON_LAYOUT_CHANGE })
+
+
+local SIDE_VECTORS = {
+	LEFT = vmath.vector3(-1, 0, 0),
+	RIGHT = vmath.vector3(1, 0, 0),
+	TOP = vmath.vector3(0, -1, 0),
+	BOT = vmath.vector3(0, 1, 0),
+}
+
+local AVAILABLE_PIVOTS = {
+	gui.PIVOT_N,
+	gui.PIVOT_S,
+	gui.PIVOT_W,
+	gui.PIVOT_E,
+}
+
+
+--- Component init function
+-- @function dynamic_grid:init
+-- @tparam node parent The gui node parent, where items will be placed
+function DynamicGrid:init(parent)
+	self.parent = self:get_node(parent)
+
+	local parent_pivot = gui.get_pivot(self.parent)
+	self.pivot = helper.get_pivot_offset(parent_pivot)
+
+	assert(helper.contains(AVAILABLE_PIVOTS, parent_pivot), const.ERRORS.GRID_DYNAMIC_ANCHOR)
+	self.side = ((parent_pivot == gui.PIVOT_W or parent_pivot == gui.PIVOT_E)
+			and const.SIDE.X or const.SIDE.Y)
+
+	self.nodes = {}
+	self.border = vmath.vector4(0) -- Current grid content size
+
+	self.on_add_item = Event()
+	self.on_remove_item = Event()
+	self.on_change_items = Event()
+	self.on_clear = Event()
+	self.on_update_positions = Event()
+
+	self._set_position_function = gui.set_position
+end
+
+
+function DynamicGrid:on_layout_change()
+	self:_update(true)
+end
+
+
+--- Return pos for grid node index
+-- @function dynamic_grid:get_pos
+-- @tparam number index The grid element index
+-- @tparam node node The node to be placed
+-- @treturn vector3 Node position
+function DynamicGrid:get_pos(index, node, origin_index)
+	local origin_node = self.nodes[origin_index]
+
+	-- If anchor node is not exist, check around nodes
+	if not origin_node then
+		if self.nodes[index + 1] then
+			origin_index = index + 1
+		end
+		if self.nodes[index - 1] then
+			origin_index = index - 1
+		end
+		origin_node = self.nodes[origin_index]
+	end
+
+	if not origin_node then
+		assert(not self.first_index, "Dynamic Grid can't have gaps between nodes. Error on grid:add")
+
+		-- If not origin node, so it should be first element in the grid
+		local size = self:_get_node_size(node)
+		local pivot = const.PIVOTS[gui.get_pivot(node)]
+		return vmath.vector3(
+			size.x * pivot.x - size.x * self.pivot.x,
+			size.y * pivot.y - size.y * self.pivot.y,
+			0)
+	end
+
+	if origin_node then
+		-- Other nodes spawn from other side of the origin node
+		local is_forward = origin_index < index
+		local delta = is_forward and 1 or -1
+		return self:_get_next_node_pos(index - delta, node, self:_get_side_vector(self.side, is_forward))
+	end
+end
+
+
+--- Add new node to the grid
+-- @function dynamic_grid:add
+--	@tparam node node Gui node
+-- @tparam[opt] number index The node position. By default add as last node
+-- @tparam[opt=false] bool is_shift_left If true, shift all nodes to the left, otherwise shift nodes to the right
+function DynamicGrid:add(node, index, is_shift_left)
+	local delta = is_shift_left and -1 or 1
+
+	-- By default add node at end
+	index = index or ((self.last_index or 0) + 1)
+
+	-- If node exist at index place, shifting them
+	local is_shift = self.nodes[index]
+	if is_shift then
+		-- We need to iterate from index to start or end grid, depends of shift side
+		local start_index = is_shift_left and self.first_index or self.last_index
+		for i = start_index, index, -delta do
+			self.nodes[i + delta] = self.nodes[i]
+		end
+	end
+
+	self:_add_node(node, index, index - delta)
+
+	-- After shifting we should recalc node poses
+	if is_shift then
+		-- We need to iterate from placed node to start or end grid, depends of shift side
+		local target_index = is_shift_left and self.first_index or self.last_index
+		for i = index + delta, target_index + delta, delta do
+			local move_node = self.nodes[i]
+			move_node.pos = self:get_pos(i, move_node.node, i - delta)
+		end
+	end
+
+
+	-- Sync grid data
+	self:_update()
+
+	self.on_add_item:trigger(self:get_context(), node, index)
+	self.on_change_items:trigger(self:get_context(), index)
+end
+
+
+--- Remove the item from the grid. Note that gui node will be not deleted
+-- @function dynamic_grid:remove
+-- @tparam number index The grid node index to remove
+-- @tparam[opt=false] bool is_shift_left If true, shift all nodes to the left, otherwise shift nodes to the right
+function DynamicGrid:remove(index, is_shift_left)
+	local delta = is_shift_left and -1 or 1
+
+	assert(self.nodes[index], "No grid item at given index " .. index)
+
+	-- Just set nil for delete node data
+	self.nodes[index] = nil
+
+	-- After delete node, we should shift nodes and recalc their poses, depends from is_shift_left
+	local target_index = is_shift_left and self.first_index or self.last_index
+	for i = index, target_index, delta do
+		self.nodes[i] = self.nodes[i + delta]
+		if self.nodes[i] then
+			self.nodes[i].pos = self:get_pos(i, self.nodes[i].node, i - delta)
+		end
+	end
+
+	-- Sync grid data
+	self:_update()
+
+	self.on_add_item:trigger(self:get_context(), index)
+	self.on_change_items:trigger(self:get_context(), index)
+end
+
+
+--- Return grid content size
+-- @function dynamic_grid:get_size
+-- @treturn vector3 The grid content size
+function DynamicGrid:get_size(border)
+	border = border or self.border
+	return vmath.vector3(
+		border.z - border.x,
+		border.y - border.w,
+		0)
+end
+
+
+--- Return grid index by node
+-- @function dynamic_grid:get_index_by_node
+-- @tparam node node The gui node in the grid
+-- @treturn number The node index
+function DynamicGrid:get_index_by_node(node)
+	for index, node_info in pairs(self.nodes) do
+		if node == node_info.node then
+			return index
+		end
+	end
+
+	return nil
+end
+
+
+--- Return array of all node positions
+-- @function dynamic_grid:get_all_pos
+-- @treturn vector3[] All grid node positions
+function DynamicGrid:get_all_pos()
+	local result = {}
+	for i, node in pairs(self.nodes) do
+		table.insert(result, gui.get_position(node))
+	end
+
+	return result
+end
+
+
+--- Change set position function for grid nodes. It will call on
+-- update poses on grid elements. Default: gui.set_position
+-- @function dynamic_grid:set_position_function
+-- @tparam function callback Function on node set position
+-- @treturn druid.dynamic_grid Current grid instance
+function DynamicGrid:set_position_function(callback)
+	self._set_position_function = callback or gui.set_position
+	return self
+end
+
+
+--- Clear grid nodes array. GUI nodes will be not deleted!
+-- If you want to delete GUI nodes, use dynamic_grid.nodes array before grid:clear
+-- @function dynamic_grid:clear
+-- @treturn druid.dynamic_grid Current grid instance
+function DynamicGrid:clear()
+	self.nodes = {}
+	self:_update()
+	return self
+end
+
+
+function DynamicGrid:_add_node(node, index, origin_index)
+	self.nodes[index] = {
+		node = node,
+		pos = self:get_pos(index, node, origin_index),
+		size = self:_get_node_size(node),
+		pivot = const.PIVOTS[gui.get_pivot(node)]
+	}
+
+	-- Add new item instantly in new pos
+	gui.set_parent(node, self.parent)
+	gui.set_position(node, self.nodes[index].pos + self:_get_zero_offset())
+end
+
+
+--- Update grid inner state
+-- @function dynamic_grid:_update
+-- @tparam bool is_instant If true, node position update instantly, otherwise with set_position_function callback
+-- @local
+function DynamicGrid:_update(is_instant)
+	self:_update_indexes()
+	self:_update_borders()
+	self:_update_pos(is_instant)
+end
+
+
+--- Update first and last indexes of grid nodes
+-- @function dynamic_grid:_update_indexes
+-- @local
+function DynamicGrid:_update_indexes()
+	self.first_index = nil
+	self.last_index = nil
+	for index in pairs(self.nodes) do
+		self.first_index = self.first_index or index
+		self.last_index = self.last_index or index
+
+		self.first_index = math.min(self.first_index, index)
+		self.last_index = math.max(self.last_index, index)
+	end
+end
+
+
+--- Update grid content borders, recalculate min and max values
+-- @function dynamic_grid:_update_borders
+-- @local
+function DynamicGrid:_update_borders()
+	if not self.first_index then
+		self.border = vmath.vector4(0)
+		return
+	end
+
+	self.border = vmath.vector4(math.huge, -math.huge, -math.huge, math.huge)
+
+	for index, node in pairs(self.nodes) do
+		local pos = node.pos
+		local size = node.size
+		local pivot = node.pivot
+
+		local left = pos.x - size.x/2 - (size.x * pivot.x)
+		local right = pos.x + size.x/2 - (size.x * pivot.x)
+		local top = pos.y + size.y/2 - (size.y * pivot.y)
+		local bottom = pos.y - size.y/2 - (size.y * pivot.y)
+
+		self.border.x = math.min(self.border.x, left)
+		self.border.y = math.max(self.border.y, top)
+		self.border.z = math.max(self.border.z, right)
+		self.border.w = math.min(self.border.w, bottom)
+	end
+end
+
+
+--- Update grid nodes position
+-- @function dynamic_grid:_update_indexes
+-- @tparam bool is_instant If true, node position update instantly, otherwise with set_position_function callback
+-- @local
+function DynamicGrid:_update_pos(is_instant)
+	local offset = self:_get_zero_offset()
+
+	for index, node in pairs(self.nodes) do
+		if is_instant then
+			gui.set_position(node.node, node.pos + offset)
+		else
+			self._set_position_function(node.node, node.pos + offset)
+		end
+	end
+
+	self.on_update_positions:trigger(self:get_context())
+end
+
+
+function DynamicGrid:_get_next_node_pos(origin_node_index, new_node, place_side)
+	local node = self.nodes[origin_node_index]
+
+	local new_node_size = self:_get_node_size(new_node)
+	local new_pivot = const.PIVOTS[gui.get_pivot(new_node)]
+
+	local dist_x = (node.size.x/2 + new_node_size.x/2) * place_side.x
+	local dist_y = (node.size.y/2 + new_node_size.y/2) * place_side.y
+	local node_center_x = node.pos.x - node.size.x * node.pivot.x
+	local node_center_y = node.pos.y - node.size.y * node.pivot.y
+
+	return vmath.vector3(
+		node_center_x + dist_x + new_node_size.x * new_pivot.x,
+		node_center_y - dist_y + new_node_size.y * new_pivot.y,
+		0
+	)
+end
+
+
+function DynamicGrid:_get_node_size(node)
+	return vmath.mul_per_elem(gui.get_size(node), gui.get_scale(node))
+end
+
+
+--- Return elements offset for correct posing nodes. Correct posing at
+-- parent pivot node (0:0) with adjusting of node sizes and anchoring
+-- @function dynamic_grid:_get_zero_offset
+-- @treturn vector3 The offset vector
+-- @local
+function DynamicGrid:_get_zero_offset()
+	-- zero offset: center pos - border size * anchor
+	return vmath.vector3(
+		-((self.border.x + self.border.z)/2 + (self.border.z - self.border.x) * self.pivot.x),
+		-((self.border.y + self.border.w)/2 + (self.border.y - self.border.w) * self.pivot.y),
+		0)
+end
+
+
+--- Return side vector to correct node shifting
+function DynamicGrid:_get_side_vector(side, is_forward)
+	if side == const.SIDE.X then
+		return is_forward and SIDE_VECTORS.RIGHT or SIDE_VECTORS.LEFT
+	end
+
+	if side == const.SIDE.Y then
+		return is_forward and SIDE_VECTORS.BOT or SIDE_VECTORS.TOP
+	end
+end
+
+
+return DynamicGrid
+ /druid/extended/dynamic_grid.lua‡9LJ !=/druid/extended/dynamic_grid.lua«  C‡/  9  B=  6 99  B-  9 B= 6 -  9-  B- 99	B6 9 X€6 9 X€- 99  X€- 99=
+ 4  = 6 9)  B= - B= - B= - B= - B= - B= 6 9= K  ÀÀ ÀÀset_position_set_position_functionon_update_positionson_clearon_change_itemson_remove_itemon_add_itemvector4
+vmathborder
+nodesYX	SIDEPIVOT_EPIVOT_W	sideGRID_DYNAMIC_ANCHORERRORScontainsassertget_pivot_offset
+pivotget_pivotguiget_nodeparent
+
+helper AVAILABLE_PIVOTS const Event self  Dparent  Dparent_pivot 
+: 3   F  9  + BK  _updateself   ³ O­P 9  8  X€9   8  X€ 9   8  X€ 9  8  X$€6 9  ' B  9  B-  96 9 B86 9	9
+9	
+"	9	
+9
+ 9
+
+
+"	
+	!	9	9
+"	
+	9
+9 9"
+
+!	
+	)
+  D   X€  X€+ X€+   X€) X€)ÿÿ  9 !	
+   9 9  B C K   À	side_get_side_vector_get_next_node_posy
+pivotxvector3
+vmathget_pivotguiPIVOTS_get_node_sizeBDynamic Grid can't have gaps between nodes. Error on grid:addfirst_indexassert
+nodes	 const self  Pindex  Pnode  Porigin_index  Porigin_node Msize pivot is_forward delta 
+ Ž  QÎx"  X€)ÿÿX€)   X€9    X€)   9 8  X€  X€9   X€9    	 M€9  
+9 8
+<Oú  9  	 !
+B  X€  X€9   X€9    	 M
+€9 8
+  9 
+ 9!
+B=Oö  9 B9  9		  9
+ B	 
+ B9  9		  9
+ B	 BK  on_change_itemsget_contexttriggeron_add_item_update	nodeget_pospos_add_nodefirst_index
+nodeslast_index
+
+
+
+
+
+         !!!!!!!!"self  Rnode  Rindex  Ris_shift_left  Rdelta Lis_shift 	Cstart_index 
+  i target_index   i 	move_node  ¤   B†¡  X€)ÿÿX€) 6  9 8'  &B9 +  <  X€9   X€9    M€9	 9
+  8
+
+<
+	9	 8		 	 X
+€9	 8		  9
+  9 89!B
+=
+	Oë  9 B9	  9
+  9 B B9  9
+  9 B BK  on_change_itemsget_contexttriggeron_add_item_update	nodeget_posposlast_indexfirst_index!No grid item at given index 
+nodesassert						
+
+
+
+
+self  Cindex  Cis_shift_left  Cdelta =target_index -  i  z   ½  X€9  6 999!99!)  D wyxzvector3
+vmathborderself  border   „   8Ê6  9 BH€9 X€L FRú+  L 	node
+nodes
+pairsself  node    index node_info   ª   5Ø4  6  9 BH€6 9 6	 9		
+ B	 AFRöL get_positionguiinsert
+table
+nodes
+pairsself  result   i node   d   ç X€6 9=  L  set_positiongui_set_position_functionself  callback   ?   ñ4  =    9 BL  _update
+nodesself   ÿ  )Uø9  5 =  9  	 
+ B=  9  B=-  96 9	 B8=
+<6 9 9 B6 9 9  89  9 B BK   À_get_zero_offsetset_positionparentset_parent
+pivotget_pivotguiPIVOTS	size_get_node_sizeposget_pos	node  
+nodes					
+
+
+
+
+
+
+
+
+
+
+const self  *node  *index  *origin_index  * ƒ    Š  9  B  9 B  9  BK  _update_pos_update_borders_update_indexesself  is_instant   ù   !:”
++  =  +  = 6 9 BH€9    X€ =  9   X€ = 6 99   B=  6 99  B= FRèK  maxmin	math
+nodes
+pairslast_indexfirst_index
+self  "  index  ›  a´¤9    X€6 9)  B= K  6 96 96 9 6 9 6 9B= 6 9 BHC€99	9
+9	9
+
+ 
+!	
+	9
+9"
+
+!	
+	9
+9  
+
+99"!
+
+99  99"!99 !99"!9 6 99 9	 B=9 6 99 9 B=9 6 99 9
+ B=9 6 99 9 B=FR»K  wzmaxminyx
+pivot	sizepos
+nodes
+pairs	huge	mathvector4
+vmathborderfirst_index	
+self  bF F Findex Cnode  Cpos Bsize Apivot @left 8right 0top (bottom   Ò   UÂ  9  B6 9 BH€  X€6 99	9
+ 
+
+BX€9 9	9
+ 
+
+BFRð9  9	  9
+ B AK  get_contexttriggeron_update_positions_set_position_functionpos	nodeset_positiongui
+nodes
+pairs_get_zero_offsetself   is_instant   offset   index node    ;ÊÑ9  8  9  B-  96 9 B899 9  9"99 9		 	 	9	"	9	9		9
+9
+
+9	9"
+
+!	
+	9
+9
+
+999	9"!
+
+6
+ 9 	99" !
+99" )  D  Àvector3
+vmath
+pivotposyx	sizeget_pivotguiPIVOTS_get_node_size
+nodes								const self  <origin_node_index  <new_node  <place_side  <node 9new_node_size 5new_pivot .dist_x &dist_y node_center_x node_center_y  {   ä6  96 9 B6 9 B C get_scaleget_sizeguimul_per_elem
+vmathself  node   ë  $,î6  99 99 9  9 99 9!9 9"  9 99 9  9 99 9!9 9"  )  D wy
+pivotzxbordervector3
+vmathself  % ë  Lø-  9 9 X	€  X€- 9  X€- 9L -  9 9 X	€  X€- 9  X€- 9L K   ÀÀTOPBOTY	LEFT
+RIGHTX	SIDEconst SIDE_VECTORS self  side  is_forward   å 
+ : dž „6   ' B 6  ' B6  ' B6  ' B9' 4 9 >B5
+ 6 9	)ÿÿ)  )	  B=6 9	) )  )	  B=6 9	)  )ÿÿ)	  B=6 9	)  ) )	  B=4 6 9>6 9>6 9>6 9>3 =3 =3 =3 =3 =3 =3! = 3# ="3% =$3' =&3) =(3+ =*3- =,3/ =.31 =033 =235 =437 =639 =82  €L  _get_side_vector _get_zero_offset _get_node_size _get_next_node_pos _update_pos _update_borders _update_indexes _update _add_node 
+clear set_position_function get_all_pos get_index_by_node get_size remove add get_pos on_layout_change 	initPIVOT_EPIVOT_WPIVOT_SPIVOT_NguiBOTTOP
+RIGHT	LEFT  vector3
+vmathON_LAYOUT_CHANGEdynamic_gridcreatedruid.componentdruid.helperdruid.eventdruid.constrequire                                               ! ! ! ! ! ! ! $ % % % & & & ' ' ' ( ( ( C / H F p P š x · ¡ Ã ½ Ò Ê ß Ø ê ç õ ñ ø 
+;$NBaQfdtn€xƒƒconst aEvent ^helper [component XDynamicGrid RSIDE_VECTORS 5AVAILABLE_PIVOTS (  "‡9LJ!=/druid/extended/dynamic_grid.lua« 	 C‡/  9  B=  6 99  B-  9 B= 6 -  9-  B- 99	B6 9 X€6 9 X€- 99  X€- 99=
+ 4  = 6 9)  B= - B= - B= - B= - B= - B= 6 9= K  ÀÀ ÀÀset_position_set_position_functionon_update_positionson_clearon_change_itemson_remove_itemon_add_itemvector4
+vmathborder
+nodesYX	SIDEPIVOT_EPIVOT_W	sideGRID_DYNAMIC_ANCHORERRORScontainsassertget_pivot_offset
+pivotget_pivotguiget_nodeparent
+
+helper AVAILABLE_PIVOTS const Event self  Dparent  Dparent_pivot 
+: 3   F  9  + BK  _updateself   ³ O­P 9  8  X€9   8  X€ 9   8  X€ 9  8  X$€6 9  ' B  9  B-  96 9	 B86 9	9	
+9
+
+"	
+	9
+
+9 9
+"
+
+!	
+	9
+9"
+
+99 9"!
+
+)  D   X€  X€+ X€+   X€) X€)ÿÿ	  9 !
+   9 9  B C K   À	side_get_side_vector_get_next_node_posy
+pivotxvector3
+vmathget_pivotguiPIVOTS_get_node_sizeBDynamic Grid can't have gaps between nodes. Error on grid:addfirst_indexassert
+nodes	 const self  Pindex  Pnode  Porigin_index  Porigin_node Msize pivot is_forward delta 
+ Ž  QÎx"  X€)ÿÿX€)   X€9    X€)   9 8  X€  X€9   X€9    	 M€9  
+9 8
+<Oú  9 	 
+ !B  X€  X€9   X€9    	 M
+€9 8
+  9 
+ 9!
+B=Oö  9 B9  9	  9	
+ B	
+  B9  9	  9	
+ B	
+ BK  on_change_itemsget_contexttriggeron_add_item_update	nodeget_pospos_add_nodefirst_index
+nodeslast_index
+
+
+
+
+
+         !!!!!!!!"self  Rnode  Rindex  Ris_shift_left  Rdelta Lis_shift 	Cstart_index 
+  i target_index   i 	move_node  ¤   B†¡  X€)ÿÿX€) 6  9 8'  &B9 +  <  X€9   X€9    M€9	 9
+  8
+
+<
+	9	 8		 	 X
+€9	 8		  9
+  9 89!B
+=
+	Oë  9 B9	  9
+
+  9 B	 B9  9
+
+  9 B	 BK  on_change_itemsget_contexttriggeron_add_item_update	nodeget_posposlast_indexfirst_index!No grid item at given index 
+nodesassert						
+
+
+
+
+self  Cindex  Cis_shift_left  Cdelta =target_index -  i  z   ½  X€9  6 999!99!)  D wyxzvector3
+vmathborderself  border   „ 	  8Ê6  9 BH€9 X€L FRú+  L 	node
+nodes
+pairsself  node    index node_info   ª   5Ø4  6  9 BH€6 9	 6
+ 9
+
+ B
+ AFRöL get_positionguiinsert
+table
+nodes
+pairsself  result   i node   d   ç X€6 9=  L  set_positiongui_set_position_functionself  callback   ?   ñ4  =    9 BL  _update
+nodesself   ÿ  )Uø9  5 =  9 	 
+  B=  9 	 B=-  96 9		 B8=
+<6 9 9 B6 9 9  89
+  9 B BK   À_get_zero_offsetset_positionparentset_parent
+pivotget_pivotguiPIVOTS	size_get_node_sizeposget_pos	node  
+nodes					
+
+
+
+
+
+
+
+
+
+
+const self  *node  *index  *origin_index  * ƒ    Š  9  B  9 B  9  BK  _update_pos_update_borders_update_indexesself  is_instant   ù 	  !:”
++  =  +  = 6 9 BH€9    X€ =  9   X€ = 6 99   B=  6 99  B= FRèK  maxmin	math
+nodes
+pairslast_indexfirst_index
+self  "  index  ›  a´¤9    X€6 9)  B= K  6 96 96 9 6 9 6 9B= 6 9 BHC€99	9
+9	9
+
+ 
+!	
+	9
+9"
+
+!	
+	9
+9  
+
+99"!
+
+99  99"!99 !99"!9 6 99 9	 B=9 6 99 9 B=9 6 99 9
+ B=9 6 99 9 B=FR»K  wzmaxminyx
+pivot	sizepos
+nodes
+pairs	huge	mathvector4
+vmathborderfirst_index	
+self  bF F Findex Cnode  Cpos Bsize Apivot @left 8right 0top (bottom   Ò   UÂ  9  B6 9 BH€  X€6 99
+9 BX€9 9
+9 BFRð9  9	  9
+ B AK  get_contexttriggeron_update_positions_set_position_functionpos	nodeset_positiongui
+nodes
+pairs_get_zero_offsetself   is_instant   offset   index node    ;ÊÑ9  8  9  B-  96 9	 B899 9  9"99 9		 	 	9	"	9	9		9
+9
+
+9	9"
+
+!	
+	9
+9
+
+999	9"!
+
+6
+ 9 	99" !
+99" )  D  Àvector3
+vmath
+pivotposyx	sizeget_pivotguiPIVOTS_get_node_size
+nodes								const self  <origin_node_index  <new_node  <place_side  <node 9new_node_size 5new_pivot .dist_x &dist_y node_center_x node_center_y  {   ä6  96 9 B6 9 B C get_scaleget_sizeguimul_per_elem
+vmathself  node   ë  $,î6  99 99 9  9 99 9!9 9"  9 99 9  9 99 9!9 9"  )  D wy
+pivotzxbordervector3
+vmathself  % ë  Lø-  9 9 X	€  X€- 9  X€- 9L -  9 9 X	€  X€- 9  X€- 9L K   ÀÀTOPBOTY	LEFT
+RIGHTX	SIDEconst SIDE_VECTORS self  side  is_forward   å  : dž „6   ' B 6  ' B6  ' B6  ' B9' 4 9 >B5
+ 6 9	)ÿÿ)	  )
+  B=6 9	) )	  )
+  B=6 9	)  )	ÿÿ)
+  B=6 9	)  )	 )
+  B=4 6 9>6 9>6 9>6 9>3 =3 =3 =3 =3 =3 =3! = 3# ="3% =$3' =&3) =(3+ =*3- =,3/ =.31 =033 =235 =437 =639 =82  €L  _get_side_vector _get_zero_offset _get_node_size _get_next_node_pos _update_pos _update_borders _update_indexes _update _add_node 
+clear set_position_function get_all_pos get_index_by_node get_size remove add get_pos on_layout_change 	initPIVOT_EPIVOT_WPIVOT_SPIVOT_NguiBOTTOP
+RIGHT	LEFT  vector3
+vmathON_LAYOUT_CHANGEdynamic_gridcreatedruid.componentdruid.helperdruid.eventdruid.constrequire                                               ! ! ! ! ! ! ! $ % % % & & & ' ' ' ( ( ( C / H F p P š x · ¡ Ã ½ Ò Ê ß Ø ê ç õ ñ ø 
+;$NBaQfdtn€xƒƒconst aEvent ^helper [component XDynamicGrid RSIDE_VECTORS 5AVAILABLE_PIVOTS (  druid.constdruid.eventdruid.helperdruid.component/druid/const.luac/druid/event.luac/druid/helper.luac/druid/component.luac" 
